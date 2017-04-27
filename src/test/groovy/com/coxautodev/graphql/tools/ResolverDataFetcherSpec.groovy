@@ -1,7 +1,5 @@
 package com.coxautodev.graphql.tools
 
-import com.google.common.collect.HashBiMap
-import graphql.Scalars
 import graphql.language.InputValueDefinition
 import graphql.language.NonNullType
 import graphql.language.TypeName
@@ -156,7 +154,7 @@ class ResolverDataFetcherSpec extends Specification {
     }
 
     private static ResolverDataFetcher createResolver(String methodName, List<InputValueDefinition> arguments = [], GraphQLResolver<?> resolver) {
-        ResolverDataFetcher.create(new Resolver(resolver, HashBiMap.create()), methodName, arguments)
+        ResolverDataFetcher.create(Resolver.create(resolver).findMethod(methodName, arguments))
     }
 
     private static DataFetchingEnvironment createEnvironment(Map<String, Object> arguments = [:]) {

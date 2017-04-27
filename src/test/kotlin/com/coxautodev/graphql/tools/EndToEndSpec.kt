@@ -12,6 +12,7 @@ scalar UUID
 type Query {
     # Get items by name
     items(itemsInput: ItemSearchInput!): [Item!]
+    otherItems: [OtherItem!]
     allItems: [AllItems!]
     itemsByInterface: [ItemInterface!]
     itemByUUID(uuid: UUID!): Item
@@ -81,6 +82,7 @@ val otherItems = mutableListOf(
 
 class Query: GraphQLRootResolver {
     fun items(input: ItemSearchInput): List<Item> = items.filter { it.name == input.name }
+    fun otherItems() = otherItems
     fun allItems(): List<Any> = items + otherItems
     fun itemsByInterface(): List<ItemInterface> = items + otherItems
     fun itemByUUID(uuid: UUID): Item? = items.find { it.uuid == uuid }

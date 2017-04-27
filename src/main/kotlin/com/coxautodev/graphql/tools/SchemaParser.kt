@@ -29,6 +29,7 @@ import graphql.language.ScalarTypeDefinition
 import graphql.language.SchemaDefinition
 import graphql.language.StringValue
 import graphql.language.Type
+import graphql.language.TypeDefinition
 import graphql.language.TypeName
 import graphql.language.UnionTypeDefinition
 import graphql.parser.Parser
@@ -47,6 +48,8 @@ import graphql.schema.GraphQLType
 import graphql.schema.GraphQLTypeReference
 import graphql.schema.GraphQLUnionType
 import graphql.schema.TypeResolverProxy
+import sun.reflect.generics.reflectiveObjects.ParameterizedTypeImpl
+import java.lang.reflect.ParameterizedType
 
 /**
  * Parses a GraphQL Schema and maps object fields to provided class methods.
@@ -167,28 +170,39 @@ class SchemaParser private constructor(doc: Document, resolvers: List<GraphQLRes
     }
 
     private val allDefinitions: List<Definition> = doc.definitions
-    private inline fun <reified T> getDefinitions(): List<T> = allDefinitions.filter { it is T }.map { it as T }
+    private inline fun <reified T> getDefinitions(): List<T> = allDefinitions.filterIsInstance(T::class.java)
+    private inline fun <reified T: TypeDefinition> getDefinitionsByName(): Map<String, T> = getDefinitions<T>().associateBy { it.name }
 
     private val schemaDefinitions: List<SchemaDefinition> = getDefinitions()
-    private val objectDefinitions: List<ObjectTypeDefinition> = getDefinitions()
+    private val objectDefinitions: Map<String, ObjectTypeDefinition> = getDefinitionsByName()
     private val inputObjectDefinitions: List<InputObjectTypeDefinition> = getDefinitions()
     private val enumDefinitions: List<EnumTypeDefinition> = getDefinitions()
-    private val interfaceDefinitions: List<InterfaceTypeDefinition> = getDefinitions()
-    private val unionDefinitions: List<UnionTypeDefinition> = getDefinitions()
+    private val interfaceDefinitions: Map<String, InterfaceTypeDefinition> = getDefinitionsByName()
+    private val unionDefinitions: Map<String, UnionTypeDefinition> = getDefinitionsByName()
     private val scalarDefinitions: List<ScalarTypeDefinition> = getDefinitions()
 
-    private val resolvers = resolvers.map { Resolver(it, dictionary) }.associateBy { it.name }
+    private val resolvers = resolvers.map { Resolver.create(it) }
+    private val rootResolvers = this.resolvers.filterIsInstance(RootResolver::class.java).associateBy { it.resolverType.simpleName }
+    private val resolversByDataClass = this.resolvers.filterIsInstance(DataClassResolver::class.java).associateBy { it.dataClassType }
 
     // Ensure all scalar definitions have implementations and add the definition to those.
     private val userScalars = scalarDefinitions.map { definition ->
         val provided = userScalars[definition.name] ?: throw SchemaError("Expected a user-defined GraphQL scalar type with name '${definition.name}' but found none!")
-        GraphQLScalarType(provided.name, getDocumentation(definition), provided.coercing, definition)
+        val docs = getDocumentation(definition)
+        GraphQLScalarType(provided.name, if(!docs.isEmpty()) docs else provided.description, provided.coercing, definition)
     }.associateBy { it.name!! }
+
+    /**
+     * Parses the given schema with respect to the given dictionary and returns a GraphQLSchema
+     */
+    fun makeExecutableSchema(): GraphQLSchema = parseSchemaObjects().toSchema()
 
     /**
      * Parses the given schema with respect to the given dictionary and returns GraphQL objects.
      */
     fun parseSchemaObjects(): SchemaObjects {
+
+        val typeRegistry = TypeRegistry(interfaceDefinitions, unionDefinitions)
 
         // Figure out what query and mutation types are called
         val queryType = schemaDefinitions.lastOrNull()?.operationTypeDefinitions?.find { it.name == "query" }?.type as TypeName?
@@ -197,39 +211,35 @@ class SchemaParser private constructor(doc: Document, resolvers: List<GraphQLRes
         val mutationName = mutationType?.name ?: "Mutation"
 
         // Create GraphQL objects
-        val interfaces = interfaceDefinitions.map { createInterfaceObject(it) }
-        val objects = objectDefinitions.map { createObject(it, interfaces) }
-        val unions = unionDefinitions.map { createUnionObject(it, objects) }
-        val inputObjects = inputObjectDefinitions.map { createInputObject(it) }
-        val enums = enumDefinitions.map { createEnumObject(it) }
+        val interfaces = interfaceDefinitions.values.map { createInterfaceObject(it) }
 
-        // Assign type resolver to interfaces now that we know all of the object types
-        interfaces.forEach { (it.typeResolver as TypeResolverProxy).typeResolver = InterfaceTypeResolver(dictionary.inverse(), it, objects) }
-        unions.forEach { (it.typeResolver as TypeResolverProxy).typeResolver = UnionTypeResolver(dictionary.inverse(), it, objects) }
+        val query = createRootObject(queryName, interfaces, typeRegistry)
+        val mutation = createRootObject(mutationName, interfaces, typeRegistry)
 
-        // Find query type and mutation type (if mutation type exists)
-        val query = objects.find { it.name == queryName } ?: throw SchemaError("Expected a Query object with name '$queryName' but found none!")
-        val mutation = objects.find { it.name == mutationName } ?: if(mutationType != null) throw SchemaError("Expected a Mutation object with name '$mutationName' but found none!") else null
+//        val inputObjects = inputObjectDefinitions.map { createInputObject(it) }
+//        val objects = objectDefinitions.map { createObject(it, interfaceDefinitions) }
+//        val enums = enumDefinitions.map { createEnumObject(it) }
+//        val unionDefinitions = unionDefinitions.map { createUnionObject(it, objects) }
 
-        return SchemaObjects(query, mutation, (objects + inputObjects + enums + interfaces + unions).toSet())
+        // Assign type resolver to interfaceDefinitions now that we know all of the object types
+//        interfaceDefinitions.forEach { (it.typeResolver as TypeResolverProxy).typeResolver = InterfaceTypeResolver(dictionary.inverse(), it, objects) }
+//        unionDefinitions.forEach { (it.typeResolver as TypeResolverProxy).typeResolver = UnionTypeResolver(dictionary.inverse(), it, objects) }
+//
+//        // Find query type and mutation type (if mutation type exists)
+//        val query = objects.find { it.name == queryName } ?: throw SchemaError("Expected a Query object with name '$queryName' but found none!")
+//        val mutation = objects.find { it.name == mutationName } ?: if(mutationType != null) throw SchemaError("Expected a Mutation object with name '$mutationName' but found none!") else null
+//
+//        return SchemaObjects(query, mutation, (objects + inputObjects + enums + interfaceDefinitions + unionDefinitions).toSet())
+        TODO("Finish this")
     }
 
-    /**
-     * Parses the given schema with respect to the given dictionary and returns a GraphQLSchema
-     */
-    fun makeExecutableSchema(): GraphQLSchema = parseSchemaObjects().toSchema()
+    private fun getRootResolver(name: String): RootResolver = rootResolvers[name] ?: throw SchemaError("Expected a root resolver with name '$name' but found none!")
+    private fun getObjectDefinition(name: String): ObjectTypeDefinition = objectDefinitions[name] ?: throw SchemaError("Expected an object definition with name '$name' but found none!")
 
-    private fun getResolver(name: String): Resolver {
-        return resolvers[name] ?: getDataClassResolver(name) ?: throw SchemaError("Expected resolver or data class with name '$name' but found none!")
-    }
+    private fun createRootObject(name: String, interfaces: List<GraphQLInterfaceType>, typeRegistry: TypeRegistry): GraphQLObjectType {
+        val resolver = getRootResolver(name)
+        val definition = getObjectDefinition(name)
 
-    private fun  getDataClassResolver(name: String): Resolver? {
-        return NoResolver(dictionary[name] ?: return null, dictionary)
-    }
-
-    private fun createObject(definition: ObjectTypeDefinition, interfaces: List<GraphQLInterfaceType>): GraphQLObjectType {
-        val name = definition.name
-        val resolver = getResolver(name)
         val builder = GraphQLObjectType.newObject()
             .name(name)
             .definition(definition)
@@ -242,13 +252,46 @@ class SchemaParser private constructor(doc: Document, resolvers: List<GraphQLRes
 
         definition.fieldDefinitions.forEach { fieldDefinition ->
             builder.field { field ->
-                createFieldDefinition(field, fieldDefinition)
-                field.dataFetcher(ResolverDataFetcher.create(resolver, fieldDefinition.name, fieldDefinition.inputValueDefinitions))
+                val method = resolver.findMethod(fieldDefinition.name, fieldDefinition.inputValueDefinitions)
+
+                createFieldDefinition(field, fieldDefinition, method, typeRegistry)
+                field.dataFetcher(ResolverDataFetcher.create(method))
             }
         }
 
         return builder.build()
     }
+
+//    private fun getResolver(name: String): Resolver {
+//        return resolvers[name] ?: getDataClassResolver(name) ?: throw SchemaError("Expected resolver or data class with name '$name' but found none!")
+//    }
+
+//    private fun  getDataClassResolver(name: String): Resolver? {
+//        return NoResolver(dictionary[name] ?: return null, dictionary)
+//    }
+
+//    private fun createObject(definition: ObjectTypeDefinition, interfaceDefinitions: List<GraphQLInterfaceType>): GraphQLObjectType {
+//        val name = definition.name
+//        val resolver = getResolver(name)
+//        val builder = GraphQLObjectType.newObject()
+//            .name(name)
+//            .definition(definition)
+//            .description(getDocumentation(definition))
+//
+//        definition.implements.forEach { implementsDefinition ->
+//            val interfaceName = (implementsDefinition as TypeName).name
+//            builder.withInterface(interfaceDefinitions.find { it.name == interfaceName } ?: throw SchemaError("Expected interface type with name '$interfaceName' but found none!"))
+//        }
+//
+//        definition.fieldDefinitions.forEach { fieldDefinition ->
+//            builder.field { field ->
+//                createFieldDefinition(field, fieldDefinition)
+//                field.dataFetcher(ResolverDataFetcher.create(resolver, fieldDefinition.name, fieldDefinition.inputValueDefinitions))
+//            }
+//        }
+//
+//        return builder.build()
+//    }
 
     private fun createInputObject(definition: InputObjectTypeDefinition): GraphQLInputObjectType {
         val builder = GraphQLInputObjectType.newInputObject()
@@ -296,9 +339,9 @@ class SchemaParser private constructor(doc: Document, resolvers: List<GraphQLRes
             .description(getDocumentation(definition))
             .typeResolver(TypeResolverProxy())
 
-        definition.fieldDefinitions.forEach { fieldDefinition ->
-            builder.field { field -> createFieldDefinition(field, fieldDefinition) }
-        }
+//        definition.fieldDefinitions.forEach { fieldDefinition ->
+//            builder.field { field -> createFieldDefinition(field, fieldDefinition) }
+//        }
 
         return builder.build()
     }
@@ -319,12 +362,13 @@ class SchemaParser private constructor(doc: Document, resolvers: List<GraphQLRes
         return builder.build()
     }
 
-    private fun createFieldDefinition(field: GraphQLFieldDefinition.Builder, fieldDefinition : FieldDefinition): GraphQLFieldDefinition.Builder {
+    private fun createFieldDefinition(field: GraphQLFieldDefinition.Builder, fieldDefinition: FieldDefinition, method: Resolver.FindMethodResult, typeRegistry: TypeRegistry): GraphQLFieldDefinition.Builder {
         field.name(fieldDefinition.name)
         field.definition(fieldDefinition)
         field.description(getDocumentation(fieldDefinition))
-        field.type(determineOutputType(fieldDefinition.type))
-        fieldDefinition.inputValueDefinitions.forEach { argumentDefinition ->
+        field.type(determineOutputType(fieldDefinition.type, method.method.genericReturnType, typeRegistry.forMethod(method, "return type")))
+        fieldDefinition.inputValueDefinitions.forEachIndexed { index, argumentDefinition ->
+//            val realIndex = method.normalizeIndex(index)
             field.argument { argument ->
                 argument.name(argumentDefinition.name)
                 argument.definition(argumentDefinition)
@@ -336,21 +380,41 @@ class SchemaParser private constructor(doc: Document, resolvers: List<GraphQLRes
         return field
     }
 
-    private fun determineOutputType(typeDefinition: Type) = determineType(typeDefinition) as GraphQLOutputType
-    private fun determineInputType(typeDefinition: Type) = determineType(typeDefinition) as GraphQLInputType
+    private fun determineOutputType(typeDefinition: Type, javaType: JavaType, typeRegistry: TypeRegistry.ForMethod): GraphQLOutputType {
+        return when (typeDefinition) {
+            is NonNullType -> GraphQLNonNull(determineOutputType(typeDefinition.type, javaType, typeRegistry))
+            is ListType -> {
+                if(javaType is ParameterizedType && javaType.rawType == List::class.java) {
+                    GraphQLList(determineOutputType(typeDefinition.type, javaType.actualTypeArguments.first(), typeRegistry))
+                } else {
+                    TODO("Real list error here")
+                }
 
-    private fun determineType(typeDefinition: Type): GraphQLType =
-        when (typeDefinition) {
-            is ListType -> GraphQLList(determineType(typeDefinition.type))
-            is NonNullType -> GraphQLNonNull(determineType(typeDefinition.type))
+            }
+            is TypeName -> {
+                if(javaType !is Class<*>) {
+                    TODO("Real type error here")
+                }
+                graphQLScalars[typeDefinition.name] ?: userScalars[typeDefinition.name] ?: typeRegistry.registerType(typeDefinition, javaType)
+            }
+            else -> throw SchemaError("Unknown type: $typeDefinition")
+        }
+    }
+
+    private fun determineInputType(typeDefinition: Type): GraphQLInputType {
+        return when (typeDefinition) {
+            is ListType -> GraphQLList(determineInputType(typeDefinition.type))
+            is NonNullType -> GraphQLNonNull(determineInputType(typeDefinition.type))
             is TypeName -> graphQLScalars[typeDefinition.name] ?: userScalars[typeDefinition.name] ?: GraphQLTypeReference(typeDefinition.name)
             else -> throw SchemaError("Unknown type: $typeDefinition")
         }
+    }
 
     private fun getDocumentation(node: AbstractNode): String = node.comments.map { it.content.trim() }.joinToString("\n")
 }
 
 class SchemaError(message: String, cause: Throwable? = null) : RuntimeException(message, cause)
+typealias JavaType = java.lang.reflect.Type
 
 val graphQLScalars = listOf(
     GraphQLInt,
